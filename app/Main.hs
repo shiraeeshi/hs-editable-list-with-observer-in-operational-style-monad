@@ -1,9 +1,14 @@
+{-# LANGUAGE  GeneralizedNewtypeDeriving #-}
 module Main where
 
 import Control.Monad (when, forM_)
 import Control.Exception (try)
 import System.IO (stdin, hSetEcho, hSetBuffering, hReady, BufferMode (NoBuffering) )
+import Control.Monad.State.Strict (StateT, get, modify, runStateT)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import qualified Data.Map as Map
 import ViewUtils (clearScreen, showInRectangle, clearRectangle, showInGrid, drawGrid, highlightCell, printFromBottom)
+import Prelude hiding (log)
 
 data RowData = Row { smth :: String } deriving Eq
 
@@ -15,46 +20,89 @@ initialRows = [
   , Row "something e"
   ]
 
-data AppStateData = AppState
+data AppStateData m = AppState
   { rows :: [RowData]
   , activeCellY :: Maybe Int
   , debugMessages :: [String]
-  , listeners :: AppStateListenersData
+  , listeners :: AppStateListenersData m
   }
 
-data AppStateListenersData = AppStateListeners
-  { rowsListeners :: [[RowData] -> IO ()]
-  , activeCellYListeners :: [Maybe Int -> IO ()]
-  , debugMessagesListeners :: [[String] -> IO ()]
+data AppStateListenersData m = AppStateListeners
+  { rowsListeners :: [[RowData] -> m ()]
+  , activeCellYListeners :: [Maybe Int -> m ()]
+  , debugMessagesListeners :: [[String] -> m ()]
   }
 
-addRowsListener :: ([RowData] -> IO ()) -> AppStateListenersData -> AppStateListenersData
+addRowsListener :: (Monad m, EditableListApp m) => ([RowData] -> m ()) -> AppStateListenersData m -> AppStateListenersData m
 addRowsListener listener (AppStateListeners rowsListeners _activeCellYListeners _debugMessagesListeners) =
   AppStateListeners (listener:rowsListeners) _activeCellYListeners _debugMessagesListeners
 
-addActiveCellYListener :: (Maybe Int -> IO ()) -> AppStateListenersData -> AppStateListenersData
+addActiveCellYListener :: (Monad m, EditableListApp m) => (Maybe Int -> m ()) -> AppStateListenersData m -> AppStateListenersData m
 addActiveCellYListener listener (AppStateListeners _rowsListeners activeCellYListeners _debugMessagesListeners) =
   AppStateListeners _rowsListeners (listener:activeCellYListeners) _debugMessagesListeners
 
-addDebugMessagesListener :: ([String] -> IO ()) -> AppStateListenersData -> AppStateListenersData
+addDebugMessagesListener :: (Monad m, EditableListApp m) => ([String] -> m ()) -> AppStateListenersData m -> AppStateListenersData m
 addDebugMessagesListener listener (AppStateListeners _rowsListeners _activeCellYListeners debugMessagesListeners) =
   AppStateListeners _rowsListeners _activeCellYListeners (listener:debugMessagesListeners)
+
+class EditableListApp m where
+  getList :: m [RowData]
+  getActiveCellY :: m (Maybe Int)
+  getLogs :: m [String]
+
+  updateList :: [RowData] -> m ()
+  updateActiveCellY :: Maybe Int -> m ()
+  log :: String -> m ()
+
+newtype DictStateHolder a = Dict (StateT (AppStateData DictStateHolder) IO a) deriving (Functor, Applicative, Monad, MonadIO)
+
+instance EditableListApp DictStateHolder where
+  getList = Dict $ rows <$> get
+  getActiveCellY = Dict $ activeCellY <$> get
+  getLogs = Dict $ debugMessages <$> get
+
+  updateList l = do
+    Dict $ modify $ \s -> s { rows = l }
+    reacts <- Dict $ (rowsListeners . listeners) <$> get
+    forM_ reacts ($ l)
+  updateActiveCellY y = do
+    Dict $ modify $ \s -> s { activeCellY = y }
+    s <- Dict $ get
+    let reacts = activeCellYListeners (listeners s)
+    forM_ reacts ($ y)
+  log msg = do
+    Dict $ modify $ \s -> s { debugMessages = take debugLinesCount (msg:(debugMessages s)) }
+    logs <- Dict $ debugMessages <$> get
+    reacts <- Dict $ (debugMessagesListeners . listeners) <$> get
+    forM_ reacts ($ logs)
+
+dictStateAction :: AppStateData DictStateHolder -> DictStateHolder a -> IO ()
+dictStateAction state (Dict action) = do
+  runStateT action state
+  return ()
+
+debugLinesCount = 20
 
 main :: IO ()
 main = do
   hSetBuffering stdin NoBuffering
   hSetEcho stdin False
-  let appState = AppState initialRows Nothing [] initListeners
   clearScreen
-  forM_ (rowsListeners (listeners appState)) $ \listener -> listener (rows appState)
-  loop appState
+  dictStateAction initialState $ do
+    initRows
+    loop
   where
     xUpperLeft = 0
     yUpperLeft = 0
     columnCount = 1
     columnWidth = 14
     rowCount = length initialRows
-    debugLinesCount = 20
+
+    initialState :: AppStateData DictStateHolder
+    initialState = AppState [] Nothing [] initListeners
+
+    initRows :: DictStateHolder ()
+    initRows = updateList initialRows
 
     initListeners =
         addRowsListener mainRowsListener
@@ -65,93 +113,93 @@ main = do
         empty = AppStateListeners [] [] []
 
     mainRowsListener rows = do
-      showInGrid
-        xUpperLeft
-        yUpperLeft
-        columnCount
-        columnWidth
-        Nothing
-        (map (\row -> [smth row]) rows)
+      activeCellCoords <- fmap (\y -> (0, y)) <$> getActiveCellY
+      liftIO $ showInGrid
+                 xUpperLeft
+                 yUpperLeft
+                 columnCount
+                 columnWidth
+                 activeCellCoords
+                 (map (\row -> [smth row]) rows)
+      log "updated rows"
 
     activeCellYListener activeCellY = do
       let activeCellCoords = fmap (\y -> (0, y)) activeCellY
-      drawGrid xUpperLeft yUpperLeft columnWidth columnCount rowCount
+      liftIO $ drawGrid xUpperLeft yUpperLeft columnWidth columnCount rowCount
       case activeCellCoords of
         Nothing -> return ()
-        Just coordsPair -> highlightCell xUpperLeft yUpperLeft columnWidth columnCount rowCount coordsPair
+        Just coordsPair -> do
+          liftIO $ highlightCell xUpperLeft yUpperLeft columnWidth columnCount rowCount coordsPair
+          log "highlighted cell"
 
     debugMessagesListener debugMessages = do
-      printFromBottom
-        xUpperLeft
-        (yUpperLeft+12+debugLinesCount)
-        debugMessages
+      liftIO $ printFromBottom
+                 xUpperLeft
+                 (yUpperLeft+12+debugLinesCount)
+                 debugMessages
 
-    loop appState@(AppState rows activeCellY debugMessages listenersHolder) = do
-      key <- getKey
+    loop = do
+      key <- liftIO $ getKey
       when (key /= "\ESC") $ do
         case key of
           "\ESC[A" -> do -- up
-            let newActiveCellY =
+              activeCellY <- getActiveCellY
+              let
+                newActiveCellY =
                   case activeCellY of
                     Just y -> Just $ max 0 (y-1)
                     Nothing -> Just 0
-                debugRow = "up, " ++ show(newActiveCellY)
-                newDebugRows = take debugLinesCount (debugRow:debugMessages)
-            forM_ (activeCellYListeners listenersHolder) $ \listener -> listener newActiveCellY
-            forM_ (debugMessagesListeners listenersHolder) $ \listener -> listener newDebugRows
-            loop (AppState rows newActiveCellY newDebugRows listenersHolder)
+              updateActiveCellY newActiveCellY
+              log $ "up, " ++ show(newActiveCellY)
+              loop
           "\ESC[B" -> do -- down
-            let newActiveCellY =
+              activeCellY <- getActiveCellY
+              let
+                newActiveCellY =
                   case activeCellY of
                     Just y -> Just $ min (rowCount-1) (y+1)
                     Nothing -> Just 0
-                debugRow = "down, " ++ show(newActiveCellY)
-                newDebugRows = take debugLinesCount (debugRow:debugMessages)
-            forM_ (activeCellYListeners listenersHolder) $ \listener -> listener newActiveCellY
-            forM_ (debugMessagesListeners listenersHolder) $ \listener -> listener newDebugRows
-            loop (AppState rows newActiveCellY newDebugRows listenersHolder)
+              updateActiveCellY newActiveCellY
+              log $ "down, " ++ show(newActiveCellY)
+              loop
           "\n" -> do -- enter
-            let eitherValue =
-                  case activeCellY of
-                    Nothing -> Left "there's no selected cell"
-                    Just cellIndex -> do
-                      if cellIndex < 0 || cellIndex >= (length rows)
-                        then Left $ "index out of bounds: " ++ (show cellIndex)
-                        else Right $ smth $ rows !! cellIndex
-            let 
-
-              showEditField value = do
-                let
-                  txt = "edit cell value:"
-                  lentxt = length txt
-                  yPos = 0
-                  xPos = (columnCount * (columnWidth + 1)) + 3
-                  replaceNth lst idx val = if idx < 1 then val:(tail lst) else (head lst) : (replaceNth (tail lst) (idx - 1) val)
-                showInRectangle xPos yPos lentxt [txt, value]
-                key <- getKey
-                case key of
-                  "\n" -> do
+              activeCellY <- getActiveCellY
+              rows <- getList
+                
+              let eitherValue =
                     case activeCellY of
-                      Nothing -> return ()
-                      Just cellIndex -> do
-                        clearRectangle xPos yPos lentxt 2
-                        let
-                          newRows = replaceNth rows cellIndex (Row value)
-                          msg = "updated rows"
-                          newDebugRows = take debugLinesCount (msg:debugMessages)
-                        forM_ (rowsListeners listenersHolder) $ \listener -> listener newRows
-                        forM_ (debugMessagesListeners listenersHolder) $ \listener -> listener newDebugRows
-                        loop (AppState newRows Nothing newDebugRows listenersHolder)
-                  "\DEL" -> showEditField (if (length value) == 0 then value else init value)
-                  c -> showEditField (value ++ c)
-            case eitherValue of
-              Left e -> do
-                let msg = "error: " ++ (show e)
-                let newDebugRows = take debugLinesCount (msg:debugMessages)
-                forM_ (debugMessagesListeners listenersHolder) $ \listener -> listener newDebugRows
-                loop (AppState rows activeCellY newDebugRows listenersHolder)
-              Right v -> do
-                showEditField v
+                      Nothing -> Left "there's no selected cell"
+                      Just cellIndex ->
+                        if cellIndex < 0 || cellIndex >= (length rows)
+                          then Left $ "index out of bounds: " ++ (show cellIndex)
+                          else Right $ smth $ rows !! cellIndex
+
+              let showEditField value = do
+                    let
+                      txt = "edit cell value:"
+                      lentxt = length txt
+                      yPos = 0
+                      xPos = (columnCount * (columnWidth + 1)) + 3
+                      replaceNth lst idx val = if idx < 1 then val:(tail lst) else (head lst) : (replaceNth (tail lst) (idx - 1) val)
+                    liftIO $ showInRectangle xPos yPos lentxt [txt, value]
+                    key <- liftIO $ getKey
+                    case key of
+                      "\n" -> do
+                        case activeCellY of
+                          Nothing -> return ()
+                          Just cellIndex -> do
+                            liftIO $ clearRectangle xPos yPos lentxt 2
+                            rows <- getList
+                            updateList $ replaceNth rows cellIndex (Row value)
+                            loop
+                      "\DEL" -> showEditField (if (length value) == 0 then value else init value)
+                      c -> showEditField (value ++ c)
+              case eitherValue of
+                Left e -> do
+                  log $ "error: " ++ (show e)
+                  loop
+                Right v -> do
+                  showEditField v
           "q" -> return ()
           _ -> return ()
 

@@ -1,3 +1,3 @@
-# Changelog for hs-editable-list-with-observer-primitive
+# Changelog for hs-editable-list-with-observer-in-final-style-monad
 
 ## Unreleased changes
