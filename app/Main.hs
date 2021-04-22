@@ -46,15 +46,6 @@ addDebugMessagesListener :: Monad m => ([String] -> m ()) -> AppStateListenersDa
 addDebugMessagesListener listener (AppStateListeners _rowsListeners _activeCellYListeners debugMessagesListeners) =
   AppStateListeners _rowsListeners _activeCellYListeners (listener:debugMessagesListeners)
 
--- class EditableListApp m where
---   getList :: m [RowData]
---   getActiveCellY :: m (Maybe Int)
---   getLogs :: m [String]
--- 
---   updateList :: [RowData] -> m ()
---   updateActiveCellY :: Maybe Int -> m ()
---   log :: String -> m ()
-
 data EditableListApp a where
   GetList :: EditableListApp [RowData]
   GetActiveCellY :: EditableListApp (Maybe Int)
